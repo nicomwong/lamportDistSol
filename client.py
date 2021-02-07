@@ -28,11 +28,11 @@ def handleStdIn():
             print("Exiting...")
             sys.exit()
 
-        elif re.match("write [a-z ]+", stdin):
-            sentence = stdin[6:]
+        elif re.match("write '[a-z. ]+'", stdin):
+            sentence = stdin[7:-1]
             sentenceQueue.put(sentence)
+            print(f"The sentence, '{sentence}', has been pushed to the sentenceQueue")
             incrementClk()
-            print(f"The sentence {sentence} has been pushed to the sentenceQueue")
 
         else:
             print("Invalid command.")
@@ -91,18 +91,19 @@ def broadcastRequests(clk, PID):
         clientSocketOut.send(f"request-{ json.dumps( (clk_tmp, PID_tmp) ) }".encode() )
 
 def writeSentencesToFileServer():
-    # [TODO] Finally, we have access to the shared resource, so send it the queued sentences
+    # Finally, we have access to the shared resource, so send it the queued sentences
     while not(sentenceQueue.empty() ):
         msg = fileServerSocket.recv(1024).decode()
-        incrementClk()
 
         if (msg == "ready"):
             print("Received ready from server")
+            incrementClk()  # [TODO] Not sure if supposed to increment for server messages
+
             # Send words one-by-one
             for word in sentenceQueue.get().split():
                 fileServerSocket.send(word.encode() )
                 print(f"Sent word {word} to server.")
-                incrementClk()
+                incrementClk()  # [TODO] Not sure if supposed to increment for server messages
         else:
             print(f"Received non-ready message from server. The message was {msg}. Exiting...")
             sys.exit()
@@ -162,11 +163,12 @@ threading.Thread(target=handleStdIn, daemon=True).start()
 while True:
     if not(sentenceQueue.empty() ):  # Sentence(s) is(are) queued to send
         # First, request access to the shared resource
-        reqQueue.put( (myClk, myPID) )  # Push my own request to the prio-queue
-        print(f"Pushed my own request {(myClk, myPID)} to the reqQueue")
-        print(f"Broadcasting request-{ json.dumps( (myClk, myPID) ) } to clients")
-        threading.Thread(target=broadcastRequests, args=[myClk, myPID], daemon=True).start()
-        incrementClk()
+        with clkLock:
+            reqQueue.put( (myClk, myPID) )  # Push my own request to the prio-queue
+            print(f"Pushed my own request {(myClk, myPID)} to the reqQueue")
+            print(f"Broadcasting request-{ json.dumps( (myClk, myPID) ) } to clients")
+            threading.Thread(target=broadcastRequests, args=[myClk, myPID], daemon=True).start()
+            incrementClk()
 
         # Second, wait for numClients-1 replies
         for clientSocketOut in clientSocketOutList:
