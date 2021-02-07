@@ -1,8 +1,8 @@
 import socket
 import threading
 import time
-import collections  # for deque
-import heapq    # priority-queue
+import json
+import queue    # Thread-safe
 import re
 import sys
 
@@ -10,7 +10,14 @@ def incrementClk():
     global myClk
     with clkLock:
         myClk += 1
-    return myClk
+        print(f"---Incremented clock to {myClk}---")
+
+def updateClk(otherClk):
+    # For maintaining the invariant (if a happens-before b, then clk(A) < clk(B) )
+    global myClk
+    with clkLock:
+        myClk = max(myClk - 1, otherClk) + 1    # myClk - 1 since myClk stores the time for the next event
+        print(f"---Updated clock to {myClk}---")
 
 def handleStdIn():
     # Handle std input
@@ -23,58 +30,82 @@ def handleStdIn():
 
         elif re.match("write [a-z ]+", stdin):
             sentence = stdin[6:]
-            sentenceQueue.append(sentence)
-            print(f"The sentence {sentence} has been pushed to the queue")
+            sentenceQueue.put(sentence)
+            incrementClk()
+            print(f"The sentence {sentence} has been pushed to the sentenceQueue")
 
         else:
             print("Invalid command.")
 
-def handleClientRequests(clientConn):
+def handleClientMsgsIn(clientConn):
     while True:
         msg = clientConn.recv(1024).decode()
-        print(f"Received {msg} from client with port {clientConn.getsockname()[1]}")
-        incrementClk()
-        if re.match("request-<[0-9]+,[0-9]+>", msg): # Request format is "request-<clientClk,clientPID>"
-            # [TODO] Parse & Push (clientClk, clientPID) to the reqQueue
+        print(f"Received {msg} from client with port {clientConn.getpeername()[1]}")
+
+        if re.match("request-\[[0-9]+, [0-9]+]", msg):  # Received request
+            reqOrder = tuple(json.loads(msg[8:]) )  # Parse the piggybacked order (clk, PID)
+            reqQueue.put(reqOrder)  # Push the request to the prio-queue
+            print(f"Pushed request {reqOrder} to the reqQueue")
+
+            updateClk(reqOrder[0])
+            incrementClk()
+            
+            # Respond with a reply
+            print(f"Sent reply to client with port {clientConn.getpeername()[1]}")
+            clk_tmp, PID_tmp = myClk, myPID
             incrementClk()
             simPropDelay()
-            clientConn.send("reply".encode() )
-            print(f"Sent reply to client with port {clientConn.getsockname()[1]}")
+            clientConn.send(f"reply-{ json.dumps( (clk_tmp, PID_tmp) ) }".encode() )
 
-        #elif [TODO] Handle "release" from client:
-            # Print received release
-            # Pop head of reqQueue?
+        elif re.match("release-\[[0-9]+, [0-9]+]", msg):    # Received release
+            otherClk = json.loads(msg[8:])[0]
+            updateClk(otherClk)
+            incrementClk()
+
+            reqQueue.get()  # Pop head of reqQueue
 
         else:
-            print(f"Error: Received a non-request from client at port {clientConn.getsockname()[1]}. The message was {msg}.")
+            print(f"Error: Received a non-request from client with port {clientConn.getpeername()[1]}. The message was {msg}.")
 
 def handleClientConnections():
+    # Concurrently listen for incoming client connections
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as clientSocketIn:
         clientSocketIn.bind( (socket.gethostname(), 9000 + myPID) )  # Bind to port 9000 + myPID
         clientSocketIn.listen()
-        print(f"Bound client in-port to port {clientSocketIn.getsockname()[1]}")
+        print(f"Listening for client connections on port {clientSocketIn.getsockname()[1]}")
 
         # Poll client connections in
         while True:
             clientConn, clientAddr = clientSocketIn.accept()
-            threading.Thread(target=handleClientRequests, args=[clientConn], daemon=True).start()
+            threading.Thread(target=handleClientMsgsIn, args=[clientConn], daemon=True).start() # Start a thread to handle each in-connection
             print(f"Received connection from client at port {clientAddr[1]}")
 
 def simPropDelay():
     time.sleep(2)
 
-# def broadcastRequests():
-#     # [TODO] Send requests to every client with our Logical lamport time and PID piggybacked
+def broadcastRequests(clk, PID):
+    # Send requests to every client with our logical Lamport clock and PID piggybacked
+    clk_tmp, PID_tmp = clk, PID # In case clk or PID changes concurrently
+    simPropDelay()
+    for clientSocketOut in clientSocketOutList:
+        clientSocketOut.send(f"request-{ json.dumps( (clk_tmp, PID_tmp) ) }".encode() )
 
-# def waitForReplies():
-#     # [TODO] Wait until numClients-1 replies have been received
-
-# def waitForTurn():
-#     # [TODO] Wait until we are at the top of the request queue
-
-def writeSentencesToServer():
+def writeSentencesToFileServer():
     # [TODO] Finally, we have access to the shared resource, so send it the queued sentences
-    pass
+    while not(sentenceQueue.empty() ):
+        msg = fileServerSocket.recv(1024).decode()
+        incrementClk()
+
+        if (msg == "ready"):
+            print("Received ready from server")
+            # Send words one-by-one
+            for word in sentenceQueue.get().split():
+                fileServerSocket.send(word.encode() )
+                print(f"Sent word {word} to server.")
+                incrementClk()
+        else:
+            print(f"Received non-ready message from server. The message was {msg}. Exiting...")
+            sys.exit()
 
 
 if len(sys.argv) != 3:
@@ -86,15 +117,14 @@ myPID = int(sys.argv[1])
 fileServerAddr = (socket.gethostname(), int(sys.argv[2]) )
 
 # Initialize global vars
-myClk = 1                               # Lamport logical clock
-sentenceQueue = collections.deque([])   # (Synchronous) Queue storing sentences to write to the file server
-reqQueue = []                           # Min-heap storing requests for Lamport's Distr. Soln. protocol
-clkLock = threading.RLock()             # RLock for the clock
-reqQueueLock = threading.RLock()        # [TODO] Not sure if this is needed
+myClk = 1                           # Lamport logical clock
+sentenceQueue = queue.Queue()       # (Synchronous) Queue storing sentences to write to the file server
+reqQueue = queue.PriorityQueue()    # Priority-queue for storing requests, ordered by their tuple (clk, PID)
+clkLock = threading.RLock()         # RLock for the clock
 
-# # Connect to file server
-# fileServerSocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-# fileServerSocket.connect(fileServerAddr)
+# Connect to file server
+fileServerSocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+fileServerSocket.connect(fileServerAddr)
 
 # Start a thread to concurrently accept the other clients' connections
 threading.Thread(target=handleClientConnections, daemon=True).start()
@@ -127,39 +157,43 @@ print(clientSocketOutList)
 threading.Thread(target=handleStdIn, daemon=True).start()
 
 # End of setup
-# Now, the main thread handles accessing the shared resource
 
+# Now, the main thread will handle getting access to, accessing, and releasing the shared resource
 while True:
-    if len(sentenceQueue):  # Sentence queue not empty
-        # Broadcast request to other clients
-        heapq.heappush(reqQueue, (myClk, myPID) )   # Push my own request to the queue first
+    if not(sentenceQueue.empty() ):  # Sentence(s) is(are) queued to send
+        # First, request access to the shared resource
+        reqQueue.put( (myClk, myPID) )  # Push my own request to the prio-queue
+        print(f"Pushed my own request {(myClk, myPID)} to the reqQueue")
+        print(f"Broadcasting request-{ json.dumps( (myClk, myPID) ) } to clients")
+        threading.Thread(target=broadcastRequests, args=[myClk, myPID], daemon=True).start()
         incrementClk()
-        simPropDelay()
-        for clientSocketOut in clientSocketOutList:
-            clientSocketOut.send(f"request-<{myClk},{myPID}>".encode() )
-            print(f"Sent request-<{myClk},{myPID}> to client at port {clientSocketOut.getsockname()[1]}")
 
-        # Wait for numClients-1 replies
+        # Second, wait for numClients-1 replies
         for clientSocketOut in clientSocketOutList:
             msg = clientSocketOut.recv(1024).decode()
-            if msg == "reply":
-                print(f"Received reply from client at port {clientSocketOut.getsockname()[1]}")
+            if re.match("reply-\[[0-9]+, [0-9]+]", msg):
+                print(f"Received {msg} from client at port {clientSocketOut.getpeername()[1]}")
+                otherClk = json.loads(msg[6:])[0]
+                updateClk(otherClk)
+                incrementClk()
                 continue
             else:
-                print(f"Error: received non-reply from client at port {clientSocketOut.getsockname()[1]}")
+                print(f"Error: received non-reply from client at port {clientSocketOut.getpeername()[1]}")
                 print("Exiting...")
                 sys.exit()
 
-        # Wait for our turn in the request queue
-        while not(myPID == reqQueue[0][1]):
+        # Third, wait for our turn in the request queue
+        while not(myPID == reqQueue.queue[0][1]):
             pass
 
-        # Access the shared resource
-        writeSentencesToServer()
+        # Fourth, Access the shared resource
+        writeSentencesToFileServer()
 
-        # Broadcast release to other clients
+        # Finally, release the shared resource
         for clientSocketOut in clientSocketOutList:
+            print(f"Sent release-{ json.dumps( (myClk, myPID) )} to client with port {clientSocketOut.getpeername()[1]}")
+            clk_tmp, PID_tmp = myClk, myPID
             incrementClk()  # [TODO] Not sure if supposed to increment for a sending release
+
             simPropDelay()
-            clientSocketOut.send("release".encode() )
-            print(f"Sent release to client at port {clientSocketOut.getsockname()[1]}")
+            clientSocketOut.send(f"release-{ json.dumps( (clk_tmp, PID_tmp) ) }".encode() )
