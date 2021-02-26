@@ -5,19 +5,33 @@ import json
 import queue    # Thread-safe
 import re
 import sys
+import os
 
 def incrementClk():
     global myClk
     with clkLock:
         myClk += 1
-        print(f"---Incremented clock to {myClk}---")
+        #print(f"---Incremented clock to {myClk}---")
 
 def updateClk(otherClk):
     # For maintaining the invariant (if a happens-before b, then clk(A) < clk(B) )
     global myClk
     with clkLock:
         myClk = max(myClk - 1, otherClk) + 1    # myClk - 1 since myClk stores the time for the next event
-        print(f"---Updated clock to {myClk}---")
+        #print(f"---Updated clock to {myClk}---")
+
+def doExit():
+    clientSocketIn.close()
+    
+    for clientConnIn in clientConnList:
+        clientConnIn.close()
+
+    for clientSocketOut in clientSocketOutList:
+        clientSocketOut.close()
+    
+    fileServerSocket.close()
+
+    os._exit(0)
 
 def handleStdIn():
     # Handle std input
@@ -26,9 +40,9 @@ def handleStdIn():
 
         if stdin == "exit":
             print("Exiting...")
-            sys.exit()
+            doExit()
 
-        elif re.match("write '[a-z. ]+'", stdin):
+        elif re.match("write '.+'", stdin):
             sentence = stdin[7:-1]
             sentenceQueue.put(sentence)
             print(f"The sentence, '{sentence}', has been pushed to the sentenceQueue")
@@ -39,74 +53,83 @@ def handleStdIn():
 
 def handleClientMsgsIn(clientConn):
     while True:
-        msg = clientConn.recv(1024).decode()
-        print(f"Received {msg} from client with port {clientConn.getpeername()[1]}")
+        data = clientConn.recv(1024)
 
-        if re.match("request-\[[0-9]+, [0-9]+]", msg):  # Received request
-            reqOrder = tuple(json.loads(msg[8:]) )  # Parse the piggybacked order (clk, PID)
-            reqQueue.put(reqOrder)  # Push the request to the prio-queue
-            print(f"Pushed request {reqOrder} to the reqQueue")
+        if data:
+            msg = data.decode()
+            print(f"Received {msg} from client")
 
-            updateClk(reqOrder[0])
-            incrementClk()
-            
-            # Respond with a reply
-            print(f"Sent reply to client with port {clientConn.getpeername()[1]}")
-            clk_tmp, PID_tmp = myClk, myPID
-            incrementClk()
-            simPropDelay()
-            clientConn.send(f"reply-{ json.dumps( (clk_tmp, PID_tmp) ) }".encode() )
+            if re.match("request-\[[0-9]+, [0-9]+]", msg):  # Received request
+                reqOrder = tuple(json.loads(msg[8:]) )  # Parse the piggybacked order (clk, PID)
+                reqQueue.put(reqOrder)  # Push the request to the prio-queue
+                print(f"Pushed request {reqOrder} to the reqQueue")
 
-        elif re.match("release-\[[0-9]+, [0-9]+]", msg):    # Received release
-            otherClk = json.loads(msg[8:])[0]
-            updateClk(otherClk)
-            incrementClk()
+                updateClk(reqOrder[0])
+                incrementClk()
+                
+                # Respond with a reply
+                print(f"Sent reply to client with port {clientConn.getpeername()[1]}")
+                clk_tmp, PID_tmp = myClk, myPID
+                incrementClk()
+                simPropDelay()
+                clientConn.send(f"reply-{ json.dumps( (clk_tmp, PID_tmp) ) }".encode() )
 
-            reqQueue.get()  # Pop head of reqQueue
+            elif re.match("release-\[[0-9]+, [0-9]+]", msg):    # Received release
+                otherClk = json.loads(msg[8:])[0]
+                updateClk(otherClk)
+                incrementClk()
 
-        else:
-            print(f"Error: Received a non-request from client with port {clientConn.getpeername()[1]}. The message was {msg}.")
+                reqQueue.get()  # Pop head of reqQueue
+
+            else:
+                print(f"Error: Received a non-request/release from client. The message was {msg}.")
+
+        else:   # data is empty -> other side closed their socket
+            print(f"Client with port {clientConn.getpeername()[1]} closed their socket. Closing this socket...")
+            clientConn.close()
+            sys.exit()  # Exit this thread since its only purpose was to handle this connection
 
 def handleClientConnections():
-    # Concurrently listen for incoming client connections
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as clientSocketIn:
-        clientSocketIn.bind( (socket.gethostname(), 9000 + myPID) )  # Bind to port 9000 + myPID
-        clientSocketIn.listen()
-        print(f"Listening for client connections on port {clientSocketIn.getsockname()[1]}")
-
-        # Poll client connections in
-        while True:
-            clientConn, clientAddr = clientSocketIn.accept()
-            threading.Thread(target=handleClientMsgsIn, args=[clientConn], daemon=True).start() # Start a thread to handle each in-connection
-            print(f"Received connection from client at port {clientAddr[1]}")
+    # Poll client connections in
+    for i in range(numClients - 1):
+        clientConn, clientAddr = clientSocketIn.accept()
+        clientConnList.append(clientConn)
+        threading.Thread(target=handleClientMsgsIn, args=[clientConn], daemon=True).start() # Start a thread to handle each in-connection
+        print(f"Received connection from client at port {clientAddr[1]}")
+    
+    print("Done accepting client connections")
+    clientSocketIn.close()  # Done accepting client connections
 
 def simPropDelay():
     time.sleep(2)
 
-def broadcastRequests(clk, PID):
-    # Send requests to every client with our logical Lamport clock and PID piggybacked
-    clk_tmp, PID_tmp = clk, PID # In case clk or PID changes concurrently
+def broadcastMsg(msg, clk, PID):
+    # Send msg to every client with the logical Lamport clock and PID piggybacked
+    clk_tmp, PID_tmp = clk, PID # In case clk or PID changes during prop. delay
     simPropDelay()
     for clientSocketOut in clientSocketOutList:
-        clientSocketOut.send(f"request-{ json.dumps( (clk_tmp, PID_tmp) ) }".encode() )
+        clientSocketOut.send(msg.encode() )
 
 def writeSentencesToFileServer():
     # Finally, we have access to the shared resource, so send it the queued sentences
     while not(sentenceQueue.empty() ):
-        msg = fileServerSocket.recv(1024).decode()
+        sentence = sentenceQueue.get()
 
-        if (msg == "ready"):
-            print("Received ready from server")
-            incrementClk()  # [TODO] Not sure if supposed to increment for server messages
+        # Send words one-by-one
+        for word in sentence.split():
+            msg = fileServerSocket.recv(1024).decode() # Wait for ready from server
 
-            # Send words one-by-one
-            for word in sentenceQueue.get().split():
-                fileServerSocket.send(word.encode() )
+            if (msg == "ready"):
+                print("Received ready from server")
+                incrementClk()
+
+                fileServerSocket.send(word.encode() )   # Send word
                 print(f"Sent word {word} to server.")
-                incrementClk()  # [TODO] Not sure if supposed to increment for server messages
-        else:
-            print(f"Received non-ready message from server. The message was {msg}. Exiting...")
-            sys.exit()
+                incrementClk()
+                
+            else:
+                print(f"Error: Received non-ready message from server. The message was {msg}. Exiting...")
+                doExit()
 
 
 if len(sys.argv) != 3:
@@ -123,11 +146,21 @@ sentenceQueue = queue.Queue()       # (Synchronous) Queue storing sentences to w
 reqQueue = queue.PriorityQueue()    # Priority-queue for storing requests, ordered by their tuple (clk, PID)
 clkLock = threading.RLock()         # RLock for the clock
 
+numClients = 3  # Number of clients in the system
+
 # Connect to file server
 fileServerSocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 fileServerSocket.connect(fileServerAddr)
 
-# Start a thread to concurrently accept the other clients' connections
+# Socket to listen for incoming client connections
+clientSocketIn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+#clientSocketIn.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)    # To avoid 'AddrInUse' error
+clientSocketIn.bind( (socket.gethostname(), 9000 + myPID) )  # Bind to port 9000 + myPID
+clientSocketIn.listen()
+print(f"Listening for client connections on port {clientSocketIn.getsockname()[1]}")
+
+# Start a thread to concurrently accept the clients' connections
+clientConnList = [] # Store connection sockets to close them on exit
 threading.Thread(target=handleClientConnections, daemon=True).start()
 
 # Wait until "connect" has been input to stdin
@@ -143,7 +176,6 @@ while msg != "connect":
 #   other client is 9001 + (myPID % 3)
 #   another client is 9001 + ( (myPID + 1) % 3)
 clientSocketOutList = []
-numClients = 2
 for i in range(numClients - 1):
     clientPort = 9001 + ( (myPID + i) % numClients)
     clientSocketOut = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -151,8 +183,8 @@ for i in range(numClients - 1):
     print("Connected to client with port", clientPort, "at hostname", socket.gethostname() )
     clientSocketOutList.append(clientSocketOut)
 
-print("List of client sockets out:")
-print(clientSocketOutList)
+# print("List of client sockets out:")
+# print(clientSocketOutList)
 
 # Start a thread to concurrently handle std input
 threading.Thread(target=handleStdIn, daemon=True).start()
@@ -163,11 +195,12 @@ threading.Thread(target=handleStdIn, daemon=True).start()
 while True:
     if not(sentenceQueue.empty() ):  # Sentence(s) is(are) queued to send
         # First, request access to the shared resource
-        with clkLock:
+        with clkLock:   # Ensures clk and PID don't change
             reqQueue.put( (myClk, myPID) )  # Push my own request to the prio-queue
             print(f"Pushed my own request {(myClk, myPID)} to the reqQueue")
             print(f"Broadcasting request-{ json.dumps( (myClk, myPID) ) } to clients")
-            threading.Thread(target=broadcastRequests, args=[myClk, myPID], daemon=True).start()
+            reqMsg = f"request-{ json.dumps( (myClk, myPID) ) }"
+            threading.Thread(target=broadcastMsg, args=[reqMsg, myClk, myPID], daemon=True).start()
             incrementClk()
 
         # Second, wait for numClients-1 replies
@@ -180,7 +213,7 @@ while True:
                 incrementClk()
                 continue
             else:
-                print(f"Error: received non-reply from client at port {clientSocketOut.getpeername()[1]}")
+                print(f"Error: received non-reply from client at port {clientSocketOut.getpeername()[1]}. The message was '{msg}'.")
                 print("Exiting...")
                 sys.exit()
 
@@ -192,10 +225,9 @@ while True:
         writeSentencesToFileServer()
 
         # Finally, release the shared resource
-        for clientSocketOut in clientSocketOutList:
-            print(f"Sent release-{ json.dumps( (myClk, myPID) )} to client with port {clientSocketOut.getpeername()[1]}")
-            clk_tmp, PID_tmp = myClk, myPID
-            incrementClk()  # [TODO] Not sure if supposed to increment for a sending release
-
-            simPropDelay()
-            clientSocketOut.send(f"release-{ json.dumps( (clk_tmp, PID_tmp) ) }".encode() )
+        reqQueue.get()  # Pop my own request
+        with clkLock:   # Ensures clk and PID don't change
+            print(f"Broadcasting release-{ json.dumps( (myClk, myPID) )} to clients")
+            releaseMsg = f"release-{ json.dumps( (myClk, myPID) ) }"
+            threading.Thread(target=broadcastMsg, args=[releaseMsg, myClk, myPID], daemon=True).start()
+            incrementClk()
